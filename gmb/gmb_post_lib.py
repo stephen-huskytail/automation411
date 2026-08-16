@@ -22,6 +22,29 @@ from pathlib import Path
 
 # ── Google OAuth ──────────────────────────────────────────────────────────────
 
+def get_google_oauth_credentials() -> tuple[str, str, str, str]:
+    """Load the preferred OAuth credentials for GBP posting.
+
+    Prefer Stephen's Google account because it owns/manages the Business Profiles;
+    fall back to Hermes only for legacy environments.
+    """
+    choices = [
+        ("GMB_GOOGLE", "GMB_GOOGLE_CLIENT_ID", "GMB_GOOGLE_CLIENT_SECRET", "GMB_GOOGLE_REFRESH_TOKEN"),
+        ("GBP_GOOGLE", "GBP_GOOGLE_CLIENT_ID", "GBP_GOOGLE_CLIENT_SECRET", "GBP_GOOGLE_REFRESH_TOKEN"),
+        ("STEPHEN_GOOGLE", "STEPHEN_GOOGLE_WEB_CLIENT_ID", "STEPHEN_GOOGLE_WEB_CLIENT_SECRET", "STEPHEN_GOOGLE_REFRESH_TOKEN"),
+        ("HERMES_GOOGLE", "HERMES_GOOGLE_CLIENT_ID", "HERMES_GOOGLE_CLIENT_SECRET", "HERMES_GOOGLE_REFRESH_TOKEN"),
+    ]
+    for label, client_key, secret_key, refresh_key in choices:
+        client_id = os.environ.get(client_key)
+        client_secret = os.environ.get(secret_key)
+        refresh_token = os.environ.get(refresh_key)
+        if client_id and client_secret and refresh_token:
+            return client_id, client_secret, refresh_token, label
+    raise RuntimeError(
+        "Missing Google OAuth credentials for GBP posting. Expected GMB_GOOGLE_*, "
+        "GBP_GOOGLE_*, STEPHEN_GOOGLE_*, or HERMES_GOOGLE_* env vars."
+    )
+
 def get_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
     """Exchange a refresh token for a short-lived access token."""
     url = "https://oauth2.googleapis.com/token"
@@ -57,7 +80,8 @@ def _api_call(method: str, url: str, token: str, body: dict | None = None) -> di
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+            response_body = resp.read()
+            return json.loads(response_body) if response_body else {}
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         raise RuntimeError(f"GBP API {method} {url} failed {e.code}: {body_text}")
@@ -93,6 +117,33 @@ def post_to_gbp(
         payload["media"] = [{"mediaFormat": "PHOTO", "sourceUrl": media_url}]
 
     return _api_call("POST", url, token, payload)
+
+
+def preflight_gbp_local_posts(token: str, account_id: str, location_id: str) -> dict:
+    """Verify the GBP localPosts endpoint before spending image/API credits."""
+    parent = f"accounts/{account_id}/locations/{location_id}"
+    url = f"{GBP_BASE}/{parent}/localPosts?pageSize=1"
+    return _api_call("GET", url, token)
+
+
+def list_gbp_local_posts(token: str, account_id: str, location_id: str) -> list[dict]:
+    """Return all local posts for a location, following GBP pagination."""
+    parent = f"accounts/{account_id}/locations/{location_id}"
+    url = f"{GBP_BASE}/{parent}/localPosts?pageSize=100"
+    posts: list[dict] = []
+    while url:
+        result = _api_call("GET", url, token)
+        posts.extend(result.get("localPosts", []))
+        next_token = result.get("nextPageToken")
+        url = f"{GBP_BASE}/{parent}/localPosts?pageSize=100&pageToken={urllib.parse.quote(next_token)}" if next_token else ""
+    return posts
+
+
+def delete_gbp_local_post(token: str, post_name: str) -> None:
+    """Permanently delete one exact GBP local-post resource name."""
+    if not post_name.startswith("accounts/") or "/localPosts/" not in post_name:
+        raise ValueError("post_name must be a full GBP local-post resource name")
+    _api_call("DELETE", f"{GBP_BASE}/{post_name}", token)
 
 
 # ── Phone number stripping ────────────────────────────────────────────────────
@@ -133,13 +184,15 @@ def load_state(path: str, defaults: dict) -> dict:
     if p.exists():
         try:
             data = json.loads(p.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("state root must be a JSON object")
             # merge — ensure all defaults are present
             for k, v in defaults.items():
                 if k not in data:
                     data[k] = v
             return data
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Unable to load GMB state file {path}: {exc}") from exc
     return dict(defaults)
 
 
@@ -148,29 +201,39 @@ def save_state(path: str, state: dict) -> None:
     Path(path).write_text(json.dumps(state, indent=2))
 
 
-# ── Image generation (OpenAI DALL-E) ─────────────────────────────────────────
+# ── Image generation (OpenAI Image 2) ─────────────────────────────────────────
 
 def generate_image(prompt: str, openai_api_key: str) -> bytes:
-    """Generate a 16:9 image via DALL-E 3, return raw JPEG bytes."""
+    """Generate a wide image via GPT Image 2, return raw JPEG bytes."""
     url = "https://api.openai.com/v1/images/generations"
     payload = {
-        "model": "dall-e-3",
+        "model": "gpt-image-2",
         "prompt": prompt,
         "n": 1,
-        "size": "1792x1024",  # closest to 16:9 that DALL-E 3 supports
-        "response_format": "b64_json",
-        "quality": "standard",
+        "size": "1536x1024",
+        "quality": "medium",
     }
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Authorization", f"Bearer {openai_api_key}")
     req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise RuntimeError(f"DALL-E generation failed {e.code}: {body}")
+    # gpt-image-2 can take >2 min on busy days — 180 s avoids transient timeout kills.
+    # Retry once on timeout before giving up.
+    result = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                result = json.loads(resp.read())
+            break  # success
+        except TimeoutError:
+            if attempt == 0:
+                continue  # retry once
+            raise RuntimeError("DALL-E generation timed out after 2 attempts (180 s each)")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise RuntimeError(f"DALL-E generation failed {e.code}: {body}")
+    if result is None:
+        raise RuntimeError("DALL-E generation failed: no result returned")
 
     b64 = result["data"][0]["b64_json"]
     # DALL-E 3 returns PNG — convert to JPEG
@@ -227,21 +290,35 @@ def upload_to_github(
     commit_message: str = "GMB image auto-upload",
 ) -> str:
     """Upload JPEG to GitHub, return raw.githubusercontent.com CDN URL."""
+    github_token = github_token.strip()
     b64_content = base64.b64encode(jpeg_bytes).decode()
     api_url = f"{GITHUB_API}/repos/{repo}/contents/{path_in_repo}"
 
     # Check if file already exists (to get SHA for update)
+    # Retry once on transient GitHub 5xx (e.g. 502 Bad Gateway)
     sha = None
     req = urllib.request.Request(api_url, method="GET")
     req.add_header("Authorization", f"token {github_token}")
     req.add_header("Accept", "application/vnd.github.v3+json")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            existing = json.loads(resp.read())
-            sha = existing.get("sha")
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
+    _last_err: urllib.error.HTTPError | None = None
+    for _attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                existing = json.loads(resp.read())
+                sha = existing.get("sha")
+            _last_err = None
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                break  # file doesn't exist yet — that's fine
+            if e.code >= 500 and _attempt == 0:
+                import time as _time
+                _time.sleep(5)
+                _last_err = e
+                continue  # retry once on 5xx
             raise
+    if _last_err is not None:
+        raise _last_err
 
     payload: dict = {
         "message": commit_message,
